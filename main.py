@@ -38,6 +38,17 @@ class ChatRequest(BaseModel):
     stream: bool
     model: str
 
+
+def extract_text_content(content):
+    if isinstance(content, list):
+        if not content:
+            return ""
+        first = content[0]
+        if isinstance(first, dict):
+            return first.get("text", "")
+        return first
+    return content or ""
+
 async def translate_single(text: str, source_lang: str, target_lang: str, session: aiohttp.ClientSession):
     if source_lang == target_lang:
         return {target_lang: text}
@@ -95,12 +106,7 @@ async def translate_request(chat_request: ChatRequest):
     text = ""
     for message in chat_request.messages:
         if message['role'] == 'user':
-            # text = message['content'][0]
-            content = message.get('content', "")
-            if isinstance(content, list):
-                text = content[0]
-            else:
-                text = content
+            text = extract_text_content(message.get('content', ""))
 
     if text == "":
         logging.warning("No user message found.")
