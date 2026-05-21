@@ -35,7 +35,7 @@ app.add_middleware(LogRequestsMiddleware)
 
 class ChatRequest(BaseModel):
     messages: List[dict]
-    stream: bool
+    stream: bool = False
     model: str
 
 
@@ -115,33 +115,56 @@ async def translate_request(chat_request: ChatRequest):
     logging.info(f"Translating from {source_lang} to {target_lang}, text: {text}")
 
 
-    async def sse_translate():
-        chat_message_id = str(uuid.uuid4())
-        timestamp = datetime.datetime.now().timestamp()
+    async with aiohttp.ClientSession() as session:
+        translation_result = await translate_single(text, source_lang, target_lang, session)
 
-        async with aiohttp.ClientSession() as session:
-            translation_result = await translate_single(text, source_lang, target_lang, session)
+    translated_text = translation_result.get(target_lang, "")
+    chat_message_id = str(uuid.uuid4())
+    timestamp = int(datetime.datetime.now().timestamp())
 
-            translated_text = translation_result.get(target_lang, "")
-            data = {
-                "id": chat_message_id,
-                "object": "chat.completion.chunk",
-                "created": timestamp,
-                "model": chat_request.model,
-                "choices": [
-                    {
-                        "index": 0,
-                        "delta": {
-                            "content": translated_text
-                        },
-                        "finish_reason": None
-                    }
-                ]
+    if not chat_request.stream:
+        data = {
+            "id": chat_message_id,
+            "object": "chat.completion",
+            "created": timestamp,
+            "model": chat_request.model,
+            "choices": [
+                {
+                    "index": 0,
+                    "message": {
+                        "role": "assistant",
+                        "content": translated_text
+                    },
+                    "finish_reason": "stop"
+                }
+            ],
+            "usage": {
+                "prompt_tokens": len(text),
+                "completion_tokens": len(translated_text),
+                "total_tokens": len(text) + len(translated_text)
             }
-            logging.info(f"Translated text: {translated_text}")
-            yield f"data: {json.dumps(data)}\n\n"
+        }
+        logging.info(f"Translated text (json mode): {translated_text}")
+        return data
 
-        # 在所有翻译数据发送完成后发送结束信号
+    async def sse_translate():
+        data = {
+            "id": chat_message_id,
+            "object": "chat.completion.chunk",
+            "created": timestamp,
+            "model": chat_request.model,
+            "choices": [
+                {
+                    "index": 0,
+                    "delta": {
+                        "content": translated_text
+                    },
+                    "finish_reason": None
+                }
+            ]
+        }
+        logging.info(f"Translated text (stream mode): {translated_text}")
+        yield f"data: {json.dumps(data)}\n\n"
         yield "data: [DONE]\n\n"
 
     return StreamingResponse(sse_translate(), media_type="text/event-stream")
