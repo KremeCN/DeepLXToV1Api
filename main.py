@@ -10,6 +10,7 @@ import datetime
 import json
 import uuid
 import time 
+import re
 
 logging.basicConfig(level=logging.INFO)
 
@@ -48,6 +49,137 @@ def extract_text_content(content):
             return first.get("text", "")
         return first
     return content or ""
+
+
+LANG_ALIASES = {
+    # English
+    "en": "EN",
+    "en-us": "EN",
+    "en_us": "EN",
+    "en-gb": "EN",
+    "en_gb": "EN",
+    "english": "EN",
+    # Chinese simplified
+    "zh": "ZH",
+    "zh-cn": "ZH",
+    "zh_cn": "ZH",
+    "zh-hans": "ZH",
+    "zh_hans": "ZH",
+    "simplified chinese": "ZH",
+    "mandarin chinese": "ZH",
+    "simplified mandarin chinese": "ZH",
+    # Chinese traditional
+    "zh-tw": "ZH-HANT",
+    "zh_tw": "ZH-HANT",
+    "zh-hant": "ZH-HANT",
+    "zh_hant": "ZH-HANT",
+    "traditional chinese": "ZH-HANT",
+    "traditional mandarin chinese": "ZH-HANT",
+    # Japanese
+    "ja": "JA",
+    "ja-jp": "JA",
+    "ja_jp": "JA",
+    "japanese": "JA",
+    # Korean
+    "ko": "KO",
+    "ko-kr": "KO",
+    "ko_kr": "KO",
+    "korean": "KO",
+    # French
+    "fr": "FR",
+    "fr-fr": "FR",
+    "fr_fr": "FR",
+    "french": "FR",
+    # German
+    "de": "DE",
+    "de-de": "DE",
+    "de_de": "DE",
+    "german": "DE",
+    # Spanish
+    "es": "ES",
+    "es-es": "ES",
+    "es_es": "ES",
+    "spanish": "ES",
+    # Russian
+    "ru": "RU",
+    "ru-ru": "RU",
+    "ru_ru": "RU",
+    "russian": "RU",
+}
+
+
+def normalize_lang(value: str) -> str:
+    if value is None:
+        return ""
+    if not isinstance(value, str):
+        value = str(value)
+    raw = value.strip()
+    if raw == "":
+        return ""
+    key = raw.lower().replace("_", "-")
+    if key in LANG_ALIASES:
+        return LANG_ALIASES[key]
+    # Fallback: normalize obvious locale forms like pt-BR -> PT-BR, en-US -> EN-US
+    parts = [p for p in key.split("-") if p]
+    if len(parts) == 1:
+        return parts[0].upper()
+    if len(parts) >= 2:
+        return parts[0].upper() + "-" + parts[1].upper()
+    return raw.upper()
+
+
+def parse_translation_payload_from_user_json(messages: List[dict]):
+    if not messages:
+        return None, None, None, "No messages found."
+
+    user_raw = None
+    for message in messages:
+        if message.get("role") == "user":
+            user_raw = extract_text_content(message.get("content", ""))
+
+    if not isinstance(user_raw, str) or user_raw == "":
+        return None, None, None, "For model `deeplx`, the user message must be a JSON string."
+
+    payload = None
+    try:
+        payload = json.loads(user_raw)
+    except Exception:
+        # Fallback: tolerate pseudo-JSON with literal newlines inside the content string.
+        def extract_value(field_names):
+            for name in field_names:
+                pattern = rf'"{re.escape(name)}"\s*:\s*"'
+                m = re.search(pattern, user_raw)
+                if not m:
+                    continue
+                start = m.end()
+                if name in ('content', 'text', 'input', 'message'):
+                    # Take everything until the closing quote that is followed by optional whitespace then } or ,
+                    m2 = re.search(r'"\s*(?:,\s*"|\}|$)', user_raw[start:], re.S)
+                    if m2:
+                        return user_raw[start:start + m2.start()]
+                else:
+                    m2 = re.search(r'([^"\\]*(?:\\.[^"\\]*)*)"', user_raw[start:], re.S)
+                    if m2:
+                        return m2.group(1)
+            return None
+
+        payload = {
+            'source_lang': extract_value(['source_lang', 'sourceLang', 'source']) or '',
+            'target_lang': extract_value(['target_lang', 'targetLang', 'target']) or '',
+            'content': extract_value(['text', 'content', 'input', 'message']) or '',
+        }
+
+    source_lang = normalize_lang(payload.get("source_lang") or payload.get("sourceLang") or payload.get("source") or "")
+    target_lang = normalize_lang(payload.get("target_lang") or payload.get("targetLang") or payload.get("target") or "")
+    text = payload.get("text") or payload.get("content") or payload.get("input") or payload.get("message") or ""
+
+    if not target_lang:
+        return None, None, None, "For model `deeplx`, `target_lang` is required in the user JSON message."
+    if not isinstance(text, str) or text == "":
+        return None, None, None, "For model `deeplx`, `text` is required in the user JSON message."
+
+    return source_lang, target_lang, text, None
+
 
 async def translate_single(text: str, source_lang: str, target_lang: str, session: aiohttp.ClientSession):
     if source_lang == target_lang:
@@ -90,30 +222,35 @@ async def translate_request(chat_request: ChatRequest):
     request_data = jsonable_encoder(chat_request)
     logging.info(f"Received request: {request_data}")
 
-    model_split = chat_request.model.split('-')
-    # 检查 model_split 的长度，以适应不同情况
-    if len(model_split) == 3:
-        source_lang = model_split[1]
-        target_lang = model_split[2]
-    elif len(model_split) == 2:
-        source_lang = ""  # 将 source_lang 置为空
-        target_lang = model_split[1]
-    else:
-        # 如果 model_split 长度既不是 2 也不是 3，记录错误并返回
-        logging.error(f"Invalid model format: {chat_request.model}")
-        return Response(content="Invalid model format.", status_code=400)
-
     text = ""
-    for message in chat_request.messages:
-        if message['role'] == 'user':
-            text = extract_text_content(message.get('content', ""))
+    if chat_request.model == "deeplx":
+        source_lang, target_lang, text, err = parse_translation_payload_from_user_json(chat_request.messages)
+        if err:
+            logging.error(err)
+            return Response(content=err, status_code=400)
+    else:
+        model_split = chat_request.model.split('-')
+        # 检查 model_split 的长度，以适应不同情况
+        if len(model_split) == 3:
+            source_lang = model_split[1]
+            target_lang = model_split[2]
+        elif len(model_split) == 2:
+            source_lang = ""  # 将 source_lang 置为空
+            target_lang = model_split[1]
+        else:
+            # 如果 model_split 长度既不是 2 也不是 3，记录错误并返回
+            logging.error(f"Invalid model format: {chat_request.model}")
+            return Response(content="Invalid model format.", status_code=400)
 
-    if text == "":
-        logging.warning("No user message found.")
-        return Response(content="No user message found.", status_code=400)
+        for message in chat_request.messages:
+            if message['role'] == 'user':
+                text = extract_text_content(message.get('content', ""))
+
+        if text == "":
+            logging.warning("No user message found.")
+            return Response(content="No user message found.", status_code=400)
 
     logging.info(f"Translating from {source_lang} to {target_lang}, text: {text}")
-
 
     async with aiohttp.ClientSession() as session:
         translation_result = await translate_single(text, source_lang, target_lang, session)
